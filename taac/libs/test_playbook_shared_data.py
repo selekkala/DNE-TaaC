@@ -128,6 +128,38 @@ class TaacRunnerPlaybookSharedDataTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(scopes), 2)
         self.assertIsNot(scopes[0], scopes[1])
 
+    async def test_stage_and_playbook_cleanup_failures_are_both_reported(self) -> None:
+        runner = self._prepare_runner()
+        runner.async_test_case_setUp = AsyncMock()
+        runner._log_stage_health_results = AsyncMock()
+        runner._async_run_failed_test_case_investigation_if_enabled = AsyncMock()
+        runner._record_npi_iteration_error = MagicMock()
+
+        stage_error = RuntimeError("stage failed")
+        cleanup_error = ValueError("cleanup failed")
+        stage = taac_types.Stage(id="failing-stage", steps=[])
+        runner.inject_validation_stages.return_value = [stage]
+        runner.async_run_stage = AsyncMock(side_effect=stage_error)
+        runner.initialize_and_run_steps = AsyncMock(side_effect=cleanup_error)
+
+        playbook = taac_types.Playbook(
+            name="combined-stage-cleanup-failure",
+            stages=[stage],
+            cleanup_steps=[
+                taac_types.Step(name=taac_types.StepName.DUMMY_STEP)
+            ],
+        )
+
+        with self.assertRaises(ExceptionGroup) as context:
+            await runner.run_test_case(playbook, SimpleNamespace(name="dut1"))
+
+        self.assertIn("test case execution and restoration failed", str(context.exception))
+        self.assertEqual(
+            [str(error) for error in context.exception.exceptions],
+            ["stage failed", "cleanup failed"],
+        )
+        runner.async_test_case_tearDown.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()

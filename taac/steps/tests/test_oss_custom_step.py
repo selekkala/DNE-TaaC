@@ -17,6 +17,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from taac.test_as_a_config import types as taac_types
+
 from taac.constants import (
     TestCaseFailure,
     TestDevice,
@@ -25,8 +27,7 @@ from taac.constants import (
 from taac.driver.driver_constants import SwitchLldpData
 from taac.libs.parameter_evaluator import ParameterEvaluator
 from taac.steps.all_steps import NAME_TO_STEP
-from neteng.test_infra.dne.taac.steps.oss_custom_step import _HANDLERS, OssCustomStep
-from taac.test_as_a_config import types as taac_types
+from taac.steps.oss_custom_step import _HANDLERS, OssCustomStep
 
 
 class _FakeIxiaClass:

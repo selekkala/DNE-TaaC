@@ -390,6 +390,12 @@ class RbbSrv6CounterDeltaTaskTest(unittest.IsolatedAsyncioTestCase):
             hostname="rbb-r1", logger=MagicMock(), shared_data=shared
         )
 
+    def test_extract_accepts_comma_formatted_fboss_counters(self) -> None:
+        self.assertEqual(
+            self._task({})._extract("eth1/6/5  1,234,567", r"\s([0-9,]+)$"),
+            1_234_567,
+        )
+
     async def test_snapshot_then_assert_passes_on_increase(self) -> None:
         shared: dict = {}
         spec = {

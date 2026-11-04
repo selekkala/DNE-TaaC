@@ -99,6 +99,7 @@ def _create_otg_tgen(**kwargs):
         tgen.config = mock_config
         tgen._bgp_peer_names = []
         tgen._device_group_info = {}
+        tgen._bgp_route_names = {}
         tgen.test_case_uuid = None
         tgen.paused = False
         tgen.capturing = False
@@ -370,15 +371,25 @@ class TestEnableTraffic(unittest.TestCase):
         )
 
     def test_enable_by_regex_partial_match(self):
+        # Selection must be correct even on the first test case, when no
+        # previous lifecycle call has populated the disabled-flow set.
+        self.tgen._disabled_flows = set()
+        self.tgen._enable_traffic(regexes=["p1"], enable=True)
+        self.assertEqual(
+            self.tgen._disabled_flows,
+            {"routed_flow_p2_0_to_0", "bgp_flow_1"},
+        )
+
+    def test_enable_by_regex_replaces_previous_selection(self):
         self.tgen._disabled_flows = {
             "routed_flow_p1_0_to_0",
             "routed_flow_p2_0_to_0",
             "bgp_flow_1",
         }
-        self.tgen._enable_traffic(regexes=["p1"], enable=True)
+        self.tgen._enable_traffic(regexes=["bgp_flow"], enable=True)
         self.assertEqual(
             self.tgen._disabled_flows,
-            {"routed_flow_p2_0_to_0", "bgp_flow_1"},
+            {"routed_flow_p1_0_to_0", "routed_flow_p2_0_to_0"},
         )
 
     def test_no_match_is_noop(self):
@@ -440,6 +451,17 @@ class TestBeginEndTestCase(unittest.TestCase):
         self.tgen.end_test_case(traffic_regexes=None)
         self.assertTrue(self.tgen.paused)
         self.assertEqual(self.tgen._disabled_flows, {"flow1"})
+
+    def test_first_begin_enables_only_matching_flow(self):
+        flow2 = MagicMock()
+        flow2.name = "flow2"
+        flow3 = MagicMock()
+        flow3.name = "flow3"
+        self.tgen.config.flows.extend([flow2, flow3])
+
+        self.tgen.begin_test_case("uuid-selected", traffic_regexes=["^flow2$"])
+
+        self.assertEqual(self.tgen._disabled_flows, {"flow1", "flow3"})
 
 
 # -- find_bgp_peers: pure list filtering --------------------------------------
@@ -656,10 +678,14 @@ class TestBuildTrafficFlows(unittest.TestCase):
         ep_src.port_name = "p1"
         ep_src.device_group_index = 0
         ep_src.endpoint_type = ixia_types.EndpointType.IXIA_PORT
+        ep_src.network_group_index = None
+        ep_src.bgp_prefix_name = None
         ep_dst = MagicMock()
         ep_dst.port_name = "p2"
         ep_dst.device_group_index = 0
         ep_dst.endpoint_type = ixia_types.EndpointType.IXIA_PORT
+        ep_dst.network_group_index = None
+        ep_dst.bgp_prefix_name = None
         ti.source_endpoints = [ep_src]
         ti.dest_endpoints = [ep_dst]
         return ti
@@ -705,6 +731,17 @@ class TestBuildTrafficFlows(unittest.TestCase):
         tgen._build_traffic_flows()
         flows_mock.flow.assert_not_called()
 
+    def test_flow_targets_advertised_route_pool(self):
+        ti = self._make_traffic_item()
+        ti.dest_endpoints[0].network_group_index = 3
+        tgen, flow = self._setup_tgen_with_flows([ti])
+        tgen._bgp_route_names[("p2", 0, 3, "v4")] = "tail_v4_pool"
+
+        tgen._build_traffic_flows()
+
+        self.assertEqual(flow.tx_rx.device.tx_names, ["p1_DG0_ipv4"])
+        self.assertEqual(flow.tx_rx.device.rx_names, ["tail_v4_pool"])
+
 
 # -- Config builders: _resolve_endpoint ----------------------------------------
 
@@ -725,19 +762,120 @@ class TestResolveEndpoint(unittest.TestCase):
         ep.port_name = "p1"
         ep.device_group_index = 0
         ep.endpoint_type = ixia_types.EndpointType.IXIA_PORT
+        ep.network_group_index = None
+        ep.bgp_prefix_name = None
         result = tgen._resolve_endpoint(ep)
         self.assertEqual(result, "p1_DG0_ipv4")
 
-    def test_bgp_prefix_returns_prefix_name(self):
+    def test_network_group_endpoint_returns_registered_route_name(self):
         from ixia.ixia import types as ixia_types
 
         tgen = _create_otg_tgen()
+        tgen._bgp_route_names[("p1", 0, 7, "v6")] = "my_route_v6"
         ep = MagicMock()
-        ep.endpoint_type = ixia_types.EndpointType.BGP_PREFIX
-        ep.bgp_prefix_name = "my_route_v4"
+        # BasicTrafficItemConfig lowering keeps IXIA_PORT as the default
+        # endpoint type and identifies an advertised pool by network group.
+        ep.endpoint_type = ixia_types.EndpointType.IXIA_PORT
+        ep.bgp_prefix_name = None
         ep.port_name = "p1"
-        result = tgen._resolve_endpoint(ep)
-        self.assertEqual(result, "my_route_v4")
+        ep.device_group_index = 0
+        ep.network_group_index = 7
+        result = tgen._resolve_endpoint(ep, ixia_types.TrafficType.IPV6)
+        self.assertEqual(result, "my_route_v6")
+
+    def test_route_identity_includes_address_family(self):
+        from ixia.ixia import types as ixia_types
+
+        tgen = _create_otg_tgen()
+        tgen._bgp_route_names[("p1", 1, 0, "v4")] = "pool_v4"
+        tgen._bgp_route_names[("p1", 1, 0, "v6")] = "pool_v6"
+        ep = MagicMock(
+            endpoint_type=ixia_types.EndpointType.IXIA_PORT,
+            bgp_prefix_name=None,
+            port_name="p1",
+            device_group_index=1,
+            network_group_index=0,
+        )
+
+        self.assertEqual(
+            tgen._resolve_endpoint(ep, ixia_types.TrafficType.IPV4), "pool_v4"
+        )
+        self.assertEqual(
+            tgen._resolve_endpoint(ep, ixia_types.TrafficType.IPV6), "pool_v6"
+        )
+
+    def test_explicit_bgp_endpoint_without_network_group_remains_supported(self):
+        from ixia.ixia import types as ixia_types
+
+        tgen = _create_otg_tgen()
+        ep = MagicMock(
+            endpoint_type=ixia_types.EndpointType.BGP_PREFIX,
+            bgp_prefix_name="pool_v6",
+            port_name="p1",
+            device_group_index=0,
+            network_group_index=None,
+        )
+        self.assertEqual(
+            tgen._resolve_endpoint(ep, ixia_types.TrafficType.IPV6), "pool_v6"
+        )
+
+    def test_bgp_endpoint_requires_name_or_network_group(self):
+        from ixia.ixia import types as ixia_types
+
+        tgen = _create_otg_tgen()
+        ep = MagicMock(
+            endpoint_type=ixia_types.EndpointType.BGP_PREFIX,
+            bgp_prefix_name=None,
+            port_name="p1",
+            device_group_index=0,
+            network_group_index=None,
+        )
+        with self.assertRaisesRegex(ValueError, "bgp_prefix_name or network_group"):
+            tgen._resolve_endpoint(ep, ixia_types.TrafficType.IPV6)
+
+    def test_missing_route_pool_fails_with_full_identity(self):
+        from ixia.ixia import types as ixia_types
+
+        tgen = _create_otg_tgen()
+        ep = MagicMock(
+            endpoint_type=ixia_types.EndpointType.IXIA_PORT,
+            bgp_prefix_name=None,
+            port_name="p1",
+            device_group_index=2,
+            network_group_index=3,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "port='p1'.*device_group_index=2.*network_group_index=3.*v4",
+        ):
+            tgen._resolve_endpoint(ep, ixia_types.TrafficType.IPV4)
+
+    def test_explicit_name_must_match_registered_route(self):
+        from ixia.ixia import types as ixia_types
+
+        tgen = _create_otg_tgen()
+        tgen._bgp_route_names[("p1", 0, 0, "v6")] = "configured_pool"
+        ep = MagicMock(
+            endpoint_type=ixia_types.EndpointType.BGP_PREFIX,
+            bgp_prefix_name="different_pool",
+            port_name="p1",
+            device_group_index=0,
+            network_group_index=0,
+        )
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            tgen._resolve_endpoint(ep, ixia_types.TrafficType.IPV6)
+
+    def test_duplicate_route_pool_identity_fails_when_names_differ(self):
+        tgen = _create_otg_tgen()
+        identity = {
+            "port_name": "p1",
+            "device_group_index": 0,
+            "network_group_index": 0,
+            "address_family": "v6",
+        }
+        tgen._register_bgp_route_name(**identity, route_name="first_pool")
+        with self.assertRaisesRegex(ValueError, "Ambiguous.*first_pool.*second_pool"):
+            tgen._register_bgp_route_name(**identity, route_name="second_pool")
 
 
 # -- Config builders: flow rate/size/duration ----------------------------------
@@ -946,6 +1084,37 @@ class TestBgpConfigBuilders(unittest.TestCase):
         self.assertEqual(addr.address, "192.168.0.0")
         self.assertEqual(addr.prefix, 24)
         self.assertEqual(addr.count, 10)
+
+    def test_bgp_config_registers_route_pool_identity(self):
+        from ixia.ixia import types as ixia_types
+
+        tgen = _create_otg_tgen()
+        device = MagicMock()
+        prefix_cfg = MagicMock()
+        prefix_cfg.prefix_name = "tail_v6_pool"
+        prefix_cfg.starting_ip = "2001:db8:100::"
+        prefix_cfg.prefix_length = 64
+        prefix_cfg.count = 10
+        prefix_cfg.increment_ip = None
+        prefix_cfg.bgp_communities = []
+        prefix_cfg.as_path_prepend = None
+        prefix_cfg.ip_address_family = ixia_types.IpAddressFamily.IPV6
+        prefix_cfg.network_group_index = 4
+        peer_cfg = self._make_bgp_peer_config()
+        bgp_info = self._make_bgp_info(
+            v6_peer_config=peer_cfg,
+            v6_prefixes=[prefix_cfg],
+        )
+
+        tgen._build_bgp_config(
+            device,
+            "p2_DG1",
+            bgp_info,
+            port_name="p2",
+            device_group_index=1,
+        )
+
+        self.assertEqual(tgen._bgp_route_names[("p2", 1, 4, "v6")], "tail_v6_pool")
 
     def test_bgp_prefix_with_communities(self):
         tgen = _create_otg_tgen()

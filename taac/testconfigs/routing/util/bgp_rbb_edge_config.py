@@ -30,6 +30,7 @@ def _strip_len(addr: str) -> str:
 # incompatible with a ``/opt/bgpd/bgp.json`` box).
 
 EDGE_EBGP_PEER_GROUP: str = "RBB-IXIA-EDGE-EBGP"
+EDGE_EBGP_V4_PEER_GROUP: str = "RBB-IXIA-EDGE-EBGP-V4"
 
 
 def enable_ipv6_afi_on_ibgp(
@@ -38,8 +39,10 @@ def enable_ipv6_afi_on_ibgp(
     ibgp_next_hop6: str | None = None,
     ibgp_peer_addr: str | None = None,
     ibgp_next_hop_self: bool | None = None,
+    enable_ipv6_afi: bool = True,
+    enable_ipv4_afi: bool = False,
 ) -> dict[str, t.Any]:
-    """Converge v6 settings for a safely selected iBGP group and peer.
+    """Converge AFI settings for a safely selected iBGP group and peer.
 
     An iBGP peer group is one whose ``remote_as_4_byte`` equals the box's
     ``local_as_4_byte``. Supplying ``ibgp_peer_addr`` restricts the mutation to
@@ -50,7 +53,13 @@ def enable_ipv6_afi_on_ibgp(
     ``ibgp_next_hop6`` and ``ibgp_next_hop_self=True`` makes the receiver install
     the edge pool with an underlay-resolvable SID next hop. The explicit segment
     list on the head's TE_AGENT route triggers SRv6 encapsulation.
+    ``enable_ipv6_afi`` defaults to true for compatibility with the original
+    IPv6-only edge helper.  Dual-stack callers additionally request
+    ``enable_ipv4_afi`` so an existing IPv6-only core group cannot silently
+    block propagation of the IXIA IPv4 pools.
     """
+    if not isinstance(enable_ipv6_afi, bool) or not isinstance(enable_ipv4_afi, bool):
+        raise ValueError("iBGP AFI enable flags must be booleans")
     if ibgp_next_hop_self is not None and not isinstance(ibgp_next_hop_self, bool):
         raise ValueError("ibgp_next_hop_self must be a boolean or None")
     local_as = config.get("local_as_4_byte")
@@ -117,7 +126,7 @@ def enable_ipv6_afi_on_ibgp(
         ibgp_peers = all_ibgp_peers
     if not ibgp_peers:
         raise ValueError("BGP config has no iBGP peer to enable for IPv6")
-    if nh6 is None:
+    if enable_ipv6_afi and nh6 is None:
         unusable_peers: list[str] = []
         for peer in ibgp_peers:
             current = _strip_len(str(peer.get("next_hop6") or ""))
@@ -135,7 +144,10 @@ def enable_ipv6_afi_on_ibgp(
 
     # Validate the complete target set before mutating the caller's document.
     for group in ibgp_groups:
-        group["disable_ipv6_afi"] = False
+        if enable_ipv6_afi:
+            group["disable_ipv6_afi"] = False
+        if enable_ipv4_afi:
+            group["disable_ipv4_afi"] = False
         if ibgp_next_hop_self is not None:
             group["next_hop_self"] = ibgp_next_hop_self
     if nh6:

@@ -115,6 +115,52 @@ class TestOSSTestExecutor(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.exception_type, "TestCaseFailure")
         self.assertFalse(result.is_transient)
 
+    async def test_aggregated_skip_cause_remains_skipped(self):
+        async def wrapped_skip(*args, **kwargs):
+            try:
+                raise unittest.SkipTest("forward references unsupported")
+            except unittest.SkipTest as error:
+                raise TestCaseFailure("one playbook failed") from error
+
+        self.mock_runner.run_tests = wrapped_skip
+        result = await self.executor.execute_playbook(
+            playbook=self.mock_playbook,
+            dut="device1",
+            test_config="test_config",
+        )
+
+        self.assertEqual(result.status, OSSTestStatus.SKIPPED)
+        self.assertEqual(result.exception_type, "SkipTest")
+        self.assertIn("forward references unsupported", result.message)
+        self.mock_logger.info.assert_any_call(
+            "Playbook 'test_playbook' SKIPPED on device1: "
+            "forward references unsupported"
+        )
+        self.mock_logger.error.assert_not_called()
+
+    async def test_skip_plus_cleanup_failure_remains_failed(self):
+        cleanup_group = ExceptionGroup(
+            "test execution and restoration failed",
+            [
+                unittest.SkipTest("forward references unsupported"),
+                RuntimeError("cleanup failed"),
+            ],
+        )
+
+        async def wrapped_cleanup_failure(*args, **kwargs):
+            raise TestCaseFailure("one playbook failed") from cleanup_group
+
+        self.mock_runner.run_tests = wrapped_cleanup_failure
+        result = await self.executor.execute_playbook(
+            playbook=self.mock_playbook,
+            dut="device1",
+            test_config="test_config",
+        )
+
+        self.assertEqual(result.status, OSSTestStatus.FAILED)
+        self.assertEqual(result.exception_type, "TestCaseFailure")
+        self.mock_logger.error.assert_called_once()
+
     async def test_timeout_error_returns_timeout(self):
         self.mock_runner.run_tests = self._async_raise(TimeoutError("Test timed out"))
         result = await self.executor.execute_playbook(

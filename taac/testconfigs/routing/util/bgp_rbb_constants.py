@@ -175,6 +175,13 @@ TAIL_DEST_PREFIX: str = os.environ.get(
     f"{_DEFAULT_IXIA_TAIL_PREFIX}/{_DEFAULT_IXIA_TAIL_PREFIX_LEN}",
 )
 
+# Device-only named-NHG lifecycle tests must not take ownership of the active
+# IXIA service prefix. Adopters may override this isolated documentation-range
+# destination, but preflight rejects overlap with the live SRv6 plan.
+NAMED_NHG_TEST_PREFIX: str = os.environ.get(
+    "TAAC_RBB_NAMED_NHG_TEST_PREFIX", "2001:db8:ff00::/64"
+)
+
 # Optional platform-specific display token for the S10 core-RIF verify. When it
 # is empty, TAAC derives the expected IPv6 address from the topology-selected
 # CORE<n> setting. Most users should leave this unset.

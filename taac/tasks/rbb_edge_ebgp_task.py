@@ -49,6 +49,7 @@ from taac.testconfigs.routing.util.bgp_rbb_bootstrap_config import (
     validate_bootstrap_device_paths,
 )
 from taac.testconfigs.routing.util.bgp_rbb_edge_config import (
+    EDGE_EBGP_V4_PEER_GROUP,
     add_edge_ebgp_peer,
     enable_ipv6_afi_on_ibgp,
     withdraw_originated_ipv6_network,
@@ -98,6 +99,13 @@ class RbbEdgeEbgpTask(BaseTask):
             withdraw_network6_prefix: optional exact local IPv6 network to
                 withdraw before IXIA advertises it. Other networks are preserved.
             edge_rif_cidr: edge SVI address to add to agent.conf if missing.
+            edge_peer_addr4: optional IXIA IPv4 eBGP peer. When supplied,
+                edge_local_addr4 and edge_rif_cidr4 are also required.
+            edge_local_addr4: optional DUT IPv4 edge address.
+            edge_rif_cidr4: optional IPv4 address for the same edge SVI. The
+                IPv4 and IPv6 RIFs are validated and applied in one agent edit.
+                Supplying the IPv4 companion also enables IPv4 AFI on the
+                safely selected core iBGP group.
             edge_intf_id: optional AgentConfig SVI id; by default it is derived
                 from ``edge_port_name``'s ``ingressVlan``.
             force: preserve an existing recovery snapshot and intentionally
@@ -160,6 +168,44 @@ class RbbEdgeEbgpTask(BaseTask):
             raise ValueError("rbb_edge_ebgp edge_remote_as must be an integer") from exc
         if not 1 <= remote_as_value <= 0xFFFFFFFF:
             raise ValueError("rbb_edge_ebgp edge_remote_as must be 1..4294967295")
+
+        peer_addr4 = params.get("edge_peer_addr4")
+        local_addr4 = params.get("edge_local_addr4")
+        edge_rif_cidr4 = params.get("edge_rif_cidr4")
+        v4_param_names = (
+            "edge_peer_addr4",
+            "edge_local_addr4",
+            "edge_rif_cidr4",
+        )
+        v4_requested = any(name in params for name in v4_param_names)
+        if v4_requested and not all(
+            isinstance(value, str) and value.strip()
+            for value in (peer_addr4, local_addr4, edge_rif_cidr4)
+        ):
+            raise ValueError(
+                "rbb_edge_ebgp IPv4 companion requires non-empty "
+                "'edge_peer_addr4', 'edge_local_addr4', and 'edge_rif_cidr4'"
+            )
+        peer_ip4: ipaddress.IPv4Address | None = None
+        local_ip4: ipaddress.IPv4Address | None = None
+        if v4_requested:
+            try:
+                parsed_peer4 = ipaddress.ip_address(str(peer_addr4))
+                parsed_local4 = ipaddress.ip_address(str(local_addr4))
+            except ValueError as exc:
+                raise ValueError(
+                    f"rbb_edge_ebgp requires valid IPv4 peer/local IPs: {exc}"
+                ) from exc
+            if parsed_peer4.version != 4 or parsed_local4.version != 4:
+                raise ValueError(
+                    "rbb_edge_ebgp IPv4 companion peer/local addresses must use IPv4"
+                )
+            if parsed_peer4 == parsed_local4:
+                raise ValueError(
+                    "rbb_edge_ebgp IPv4 companion peer/local addresses must differ"
+                )
+            peer_ip4 = t.cast(ipaddress.IPv4Address, parsed_peer4)
+            local_ip4 = t.cast(ipaddress.IPv4Address, parsed_local4)
         srv6_nexthop = params.get("ibgp_srv6_nexthop")
         ibgp_peer_addr = params.get("ibgp_peer_addr")
         ibgp_next_hop_self = params.get("ibgp_next_hop_self")
@@ -167,12 +213,50 @@ class RbbEdgeEbgpTask(BaseTask):
             raise ValueError(  # noqa: TRY004
                 "rbb_edge_ebgp ibgp_next_hop_self must be a JSON boolean"
             )
-        if (enable_v6 or srv6_nexthop or ibgp_next_hop_self is not None) and not (
-            ibgp_peer_addr
-        ):
+        edge_rif_cidr = params.get("edge_rif_cidr")
+        if edge_rif_cidr:
+            try:
+                edge_interface = ipaddress.ip_interface(str(edge_rif_cidr))
+            except ValueError as exc:
+                raise ValueError(f"rbb_edge_ebgp invalid edge_rif_cidr: {exc}") from exc
+            if edge_interface.ip != local_ip:
+                raise ValueError(
+                    "rbb_edge_ebgp edge_rif_cidr address must equal edge_local_addr"
+                )
+            if peer_ip not in edge_interface.network:
+                raise ValueError(
+                    "rbb_edge_ebgp edge peer and local RIF must share a subnet"
+                )
+        if v4_requested:
+            if not edge_rif_cidr:
+                raise ValueError(
+                    "rbb_edge_ebgp IPv4 companion requires the primary "
+                    "'edge_rif_cidr' so both RIF addresses are applied atomically"
+                )
+            try:
+                edge_interface4 = ipaddress.ip_interface(str(edge_rif_cidr4))
+            except ValueError as exc:
+                raise ValueError(
+                    f"rbb_edge_ebgp invalid edge_rif_cidr4: {exc}"
+                ) from exc
+            if edge_interface4.version != 4:
+                raise ValueError("rbb_edge_ebgp edge_rif_cidr4 must use IPv4")
+            if edge_interface4.ip != local_ip4:
+                raise ValueError(
+                    "rbb_edge_ebgp edge_rif_cidr4 address must equal edge_local_addr4"
+                )
+            if peer_ip4 not in edge_interface4.network:
+                raise ValueError(
+                    "rbb_edge_ebgp IPv4 edge peer and local RIF must share a subnet"
+                )
+
+        configure_v6_ibgp = bool(
+            enable_v6 or srv6_nexthop or ibgp_next_hop_self is not None
+        )
+        if (configure_v6_ibgp or v4_requested) and not ibgp_peer_addr:
             raise ValueError(
                 "rbb_edge_ebgp requires 'ibgp_peer_addr' when changing the "
-                "iBGP IPv6 configuration"
+                "iBGP address-family configuration"
             )
         if ibgp_peer_addr:
             try:
@@ -190,21 +274,6 @@ class RbbEdgeEbgpTask(BaseTask):
                     f"rbb_edge_ebgp invalid ibgp_srv6_nexthop: {exc}"
                 ) from exc
 
-        edge_rif_cidr = params.get("edge_rif_cidr")
-        if edge_rif_cidr:
-            try:
-                edge_interface = ipaddress.ip_interface(str(edge_rif_cidr))
-            except ValueError as exc:
-                raise ValueError(f"rbb_edge_ebgp invalid edge_rif_cidr: {exc}") from exc
-            if edge_interface.ip != local_ip:
-                raise ValueError(
-                    "rbb_edge_ebgp edge_rif_cidr address must equal edge_local_addr"
-                )
-            if peer_ip not in edge_interface.network:
-                raise ValueError(
-                    "rbb_edge_ebgp edge peer and local RIF must share a subnet"
-                )
-
         bgp_cfg, bgp_changed = await self._prepare_bgp_json(
             driver,
             hostname,
@@ -212,6 +281,7 @@ class RbbEdgeEbgpTask(BaseTask):
             remote_as=remote_as_value,
             local_addr=str(local_addr),
             enable_v6=enable_v6,
+            enable_v4=v4_requested,
             srv6_nexthop=str(srv6_nexthop) if srv6_nexthop else None,
             ibgp_peer_addr=str(ibgp_peer_addr) if ibgp_peer_addr else None,
             ibgp_next_hop_self=ibgp_next_hop_self,
@@ -220,6 +290,8 @@ class RbbEdgeEbgpTask(BaseTask):
                 if params.get("withdraw_network6_prefix")
                 else None
             ),
+            peer_addr4=str(peer_addr4) if v4_requested else None,
+            local_addr4=str(local_addr4) if v4_requested else None,
         )
 
         agent_cfg: dict[str, t.Any] | None = None
@@ -235,6 +307,7 @@ class RbbEdgeEbgpTask(BaseTask):
                     if params.get("edge_intf_id") is not None
                     else None
                 ),
+                companion_cidr=(str(edge_rif_cidr4) if v4_requested else None),
             )
 
         if bgp_changed or (agent_changed and agent_cfg is not None):
@@ -351,7 +424,9 @@ class RbbEdgeEbgpTask(BaseTask):
             ) from exc
 
         self.logger.info(
-            f"{hostname} -- edge eBGP applied (peer {peer_addr} AS {remote_as})"
+            f"{hostname} -- edge eBGP applied (peer {peer_addr} AS {remote_as}"
+            + (f", IPv4 peer {peer_addr4}" if v4_requested else "")
+            + ")"
         )
 
     @staticmethod
@@ -398,10 +473,13 @@ class RbbEdgeEbgpTask(BaseTask):
         remote_as: int,
         local_addr: str,
         enable_v6: bool,
+        enable_v4: bool,
         srv6_nexthop: str | None,
         ibgp_peer_addr: str | None,
         ibgp_next_hop_self: bool | None,
         withdraw_network6_prefix: str | None,
+        peer_addr4: str | None,
+        local_addr4: str | None,
     ) -> tuple[dict[str, t.Any], bool]:
         raw = await async_read_file_or_none(driver, C.BGP_CONFIG_PATH)
         if not raw:
@@ -417,12 +495,17 @@ class RbbEdgeEbgpTask(BaseTask):
             ) from exc
 
         before = json.loads(json.dumps(cfg))
-        if enable_v6 or srv6_nexthop or ibgp_next_hop_self is not None:
+        configure_v6_ibgp = bool(
+            enable_v6 or srv6_nexthop or ibgp_next_hop_self is not None
+        )
+        if configure_v6_ibgp or enable_v4:
             enable_ipv6_afi_on_ibgp(
                 cfg,
                 ibgp_next_hop6=str(srv6_nexthop) if srv6_nexthop else None,
                 ibgp_peer_addr=ibgp_peer_addr,
                 ibgp_next_hop_self=ibgp_next_hop_self,
+                enable_ipv6_afi=configure_v6_ibgp,
+                enable_ipv4_afi=enable_v4,
             )
         if withdraw_network6_prefix:
             withdraw_originated_ipv6_network(cfg, withdraw_network6_prefix)
@@ -433,6 +516,15 @@ class RbbEdgeEbgpTask(BaseTask):
             local_addr=local_addr,
             description=f"IXIA edge eBGP peer {peer_addr} (AS {remote_as})",
         )
+        if peer_addr4 and local_addr4:
+            add_edge_ebgp_peer(
+                cfg,
+                peer_addr=peer_addr4,
+                remote_as=remote_as,
+                local_addr=local_addr4,
+                peer_group_name=EDGE_EBGP_V4_PEER_GROUP,
+                description=(f"IXIA IPv4 edge eBGP peer {peer_addr4} (AS {remote_as})"),
+            )
         return cfg, cfg != before
 
     async def _prepare_edge_rif(
@@ -442,6 +534,7 @@ class RbbEdgeEbgpTask(BaseTask):
         cidr: str,
         port_name: str | None,
         intf_id: int | None,
+        companion_cidr: str | None = None,
     ) -> tuple[dict[str, t.Any], bool]:
         raw = await async_read_file_or_none(driver, C.AGENT_CONFIG_PATH)
         if not raw:
@@ -460,6 +553,21 @@ class RbbEdgeEbgpTask(BaseTask):
             raise TestCaseFailure(
                 f"{hostname}: invalid edge RIF CIDR {cidr!r}"
             ) from exc
+        requested_interfaces = {requested_interface}
+        if companion_cidr:
+            try:
+                companion_interface = ipaddress.ip_interface(companion_cidr)
+            except ValueError as exc:
+                raise TestCaseFailure(
+                    f"{hostname}: invalid companion edge RIF CIDR "
+                    f"{companion_cidr!r}"
+                ) from exc
+            if companion_interface.version == requested_interface.version:
+                raise TestCaseFailure(
+                    f"{hostname}: primary and companion edge RIFs must use "
+                    "different address families"
+                )
+            requested_interfaces.add(companion_interface)
         sw = cfg.get("sw")
         if not isinstance(sw, dict):
             raise TestCaseFailure(
@@ -584,12 +692,47 @@ class RbbEdgeEbgpTask(BaseTask):
             raise TestCaseFailure(
                 f"{hostname}: VLAN/interface {intf_id} contains an invalid IP address"
             ) from exc
+        if len(existing_interface_addrs) != len(interface_addrs) or len(
+            existing_vlan_addrs
+        ) != len(vlan_addrs):
+            raise TestCaseFailure(
+                f"{hostname}: edge VLAN/interface {intf_id} contains duplicate "
+                "IP addresses; refusing to normalize operator-owned state"
+            )
         changed = False
-        requested_present = (
-            requested_interface in existing_interface_addrs
-            or requested_interface in existing_vlan_addrs
-        )
-        if requested_present:
+        existing_addrs = existing_interface_addrs | existing_vlan_addrs
+        requested_present = requested_interface in existing_addrs
+        if companion_cidr:
+            if existing_vlan_addrs or not existing_interface_addrs.issubset(
+                requested_interfaces
+            ):
+                raise TestCaseFailure(
+                    f"{hostname}: dual-stack edge VLAN/interface {intf_id} may "
+                    "contain only the requested IXIA RIFs on sw.interfaces with "
+                    "an empty VLAN address list; refusing an unrelated or split "
+                    "address merge"
+                )
+            missing_cidrs = [
+                value
+                for value, interface in (
+                    (cidr, requested_interface),
+                    (t.cast(str, companion_cidr), companion_interface),
+                )
+                if interface not in existing_interface_addrs
+            ]
+            if missing_cidrs:
+                # A common preconfigured lab already owns the exact IPv6 RIF.
+                # Adding only the missing IPv4 companion remains reversible:
+                # the full original AgentConfig is snapshotted before this
+                # transformed document is written.
+                interface_addrs.extend(missing_cidrs)
+                changed = True
+            else:
+                self.logger.info(
+                    f"{hostname} -- dual-stack edge RIFs {cidr}, {companion_cidr} "
+                    "already present; preserving existing interface addresses"
+                )
+        elif requested_present:
             # A valid preconfigured FBOSS RIF can carry additional addresses
             # (for example IPv4 + IPv6) on sw.interfaces while the matching
             # sw.vlans ipAddresses list stays empty. Preserve both operator-
@@ -607,6 +750,8 @@ class RbbEdgeEbgpTask(BaseTask):
             # The stock image keeps routed addresses on sw.interfaces; its
             # corresponding sw.vlans address list remains empty.
             interface_addrs.append(cidr)
+            if companion_cidr:
+                interface_addrs.append(companion_cidr)
             changed = True
 
         # The edge port may be persisted DISABLED (state 0); the eBGP session and

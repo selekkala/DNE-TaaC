@@ -8898,15 +8898,51 @@ class Ixia:
         return pairs
 
     def find_bgp_ipv6_peer(self, port_identifier: str) -> t.Optional["BgpIpv6Peer"]:
-        """Finds the BGP peer in the IXIA setup"""
-        ipv6 = self.find_ipv6(port_identifier)
-        if not ipv6:
-            return
-        bgp_peer = ipv6.BgpIpv6Peer.find(
-            Name=DESIRED_BGP_V6_PEER_NAME.format(port_identifier=port_identifier)
+        """Find the default DG-0 IPv6 BGP peer for a declarative port.
+
+        ``BasicPortConfig`` normalizes the vport key (``PORT``) and creates
+        protocol stacks below device group ``D0_PORT``. Prefer the object index
+        that setup/rehydration already validates, then retain one exact-name
+        scan for legacy attached sessions whose index was not populated.
+        """
+        normalized_port = self.get_port_identifier(port_identifier)
+        device_group_identifier = f"D0_{normalized_port}"
+        desired_name = DESIRED_BGP_V6_PEER_NAME.format(
+            port_identifier=device_group_identifier
         )
-        if bgp_peer:
-            return bgp_peer[0]
+        # RESTPy treats string arguments to ``find`` as regular expressions.
+        # Anchor and escape the generated object name so regex metacharacters
+        # in a declarative port identifier cannot select a different peer.
+        exact_name_regex = f"^{re.escape(desired_name)}$"
+
+        vport_index = getattr(self, "vport_indices", {}).get(normalized_port)
+        device_group_index = (
+            vport_index.device_group_indices.get(0) if vport_index else None
+        )
+        ipv6 = device_group_index.ipv6 if device_group_index else None
+        if ipv6 is not None:
+            peers = list(ipv6.BgpIpv6Peer.find(Name=exact_name_regex) or ())
+            if len(peers) == 1:
+                return peers[0]
+            if len(peers) > 1:
+                raise IxiaSetupError(
+                    f"Multiple IPv6 BGP peers named {desired_name!r} were found"
+                )
+
+        # ``find_ipv6s`` returns an empty matched list when no regex is passed,
+        # so the legacy compatibility path must use an explicit catch-all.
+        matches = []
+        for candidate in self.find_ipv6s(regex=".*"):
+            matches.extend(
+                candidate.BgpIpv6Peer.find(Name=exact_name_regex) or []
+            )
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise IxiaSetupError(
+                f"Multiple IPv6 BGP peers named {desired_name!r} were found"
+            )
+        return None
 
     def restart_bgp_peers(self, regexes: t.Optional[t.List[str]] = None) -> None:
         bgp_peers_to_restart = []

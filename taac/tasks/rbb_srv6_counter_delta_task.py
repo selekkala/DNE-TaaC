@@ -60,7 +60,7 @@ class RbbSrv6CounterDeltaTask(BaseTask):
         found = False
         for m in re.finditer(regex, output):
             try:
-                total += int(m.group(1))
+                total += int(m.group(1).replace(",", ""))
                 found = True
             except (IndexError, ValueError):
                 continue

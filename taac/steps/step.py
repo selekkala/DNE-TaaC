@@ -3,6 +3,7 @@
 import os
 import time
 import typing as t
+import unittest
 from abc import ABC, abstractmethod
 
 
@@ -150,6 +151,11 @@ class Step(t.Generic[StepInput], ABC):
             raise e
         except TestCaseFailure as e:
             raise e
+        except unittest.SkipTest:
+            # SkipTest is deliberate control flow, not a failed step.  Let the
+            # runner execute normal cleanup and classify the playbook as
+            # SKIPPED without manufacturing a failing CheckResult.
+            raise
         except Exception as e:
             failure_reason = (
                 f"Step {self.__class__.__name__} failed on {self.device.name}: {str(e)}"

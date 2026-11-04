@@ -108,6 +108,24 @@ class StepEverpasteFallbackTest(unittest.IsolatedAsyncioTestCase):
         self.step.setUp.assert_awaited_once()
         self.step.run.assert_awaited_once()
 
+    @patch(f"{MODULE}.async_write_test_result", new_callable=AsyncMock)
+    @patch(f"{MODULE}.log_step_info")
+    @patch(f"{MODULE}.async_everpaste_if_needed", new_callable=AsyncMock)
+    async def test_skip_propagates_without_failed_check_result(
+        self, mock_everpaste, mock_log_step, mock_write_test_result
+    ):
+        mock_everpaste.return_value = "input logged"
+        skip = unittest.SkipTest("feature unsupported")
+        self.step.setUp = AsyncMock()
+        self.step.run = AsyncMock(side_effect=skip)
+
+        with self.assertRaises(unittest.SkipTest) as raised:
+            await self.step._run(taac_types.BaseInput(), {})
+
+        self.assertIs(raised.exception, skip)
+        self.assertEqual(self.test_case_results, [])
+        mock_write_test_result.assert_not_awaited()
+
     @patch(f"{MODULE}.log_step_info")
     @patch(f"{MODULE}.async_everpaste_if_needed", new_callable=AsyncMock)
     async def test_run_can_leave_ixia_traffic_stopped(

@@ -12,8 +12,10 @@ in classify_exception().
 import asyncio
 import time
 import traceback
+import unittest
 from typing import Optional
 
+from taac.constants import TestCaseFailure
 from taac.runner.oss_exception_classifier import (
     classify_exception,
 )
@@ -38,6 +40,15 @@ def _primary_exception(exc: BaseException) -> Optional[Exception]:
     ``TestCaseFailure`` would be reported as ERROR. Unwrap it to its first
     non-cancellation leaf; ``None`` when every leaf is a cancellation.
     """
+    # TaacRunner.run_tests aggregates per-playbook exceptions and wraps them
+    # in TestCaseFailure. Preserve an otherwise-clean SkipTest so the OSS
+    # result contract can classify an unsupported playbook as SKIPPED. Do not
+    # unwrap a group: SkipTest plus any cleanup/restoration failure must remain
+    # a real failure.
+    if isinstance(exc, TestCaseFailure) and isinstance(
+        exc.__cause__, unittest.SkipTest
+    ):
+        return exc.__cause__
     if not isinstance(exc, BaseExceptionGroup):
         return exc if isinstance(exc, Exception) else None
     for inner in exc.exceptions:
@@ -166,8 +177,18 @@ class OSSTestExecutor:
             exception_message = str(cause)
             stacktrace = traceback.format_exc()
             message = f"{exception_type}: {cause}"
-            log = self._logger.warning if is_transient else self._logger.error
-            log(f"Playbook '{playbook.name}' {status.name} on {dut}: {e}")
+            log = (
+                self._logger.info
+                if status == OSSTestStatus.SKIPPED
+                else self._logger.warning
+                if is_transient
+                else self._logger.error
+            )
+            displayed_error = cause if status == OSSTestStatus.SKIPPED else e
+            log(
+                f"Playbook '{playbook.name}' {status.name} on {dut}: "
+                f"{displayed_error}"
+            )
 
         duration = time.time() - start_time
 

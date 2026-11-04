@@ -82,6 +82,7 @@ class OtgTrafficGen(AbstractTrafficGenerator):
         # Built during _build_config
         self._bgp_peer_names: t.List[str] = []
         self._device_group_info: t.Dict[t.Tuple[str, int], t.Dict[str, t.Any]] = {}
+        self._bgp_route_names: t.Dict[t.Tuple[str, int, int, str], str] = {}
 
         # TaacRunner-facing state
         self.test_case_uuid: t.Optional[str] = None
@@ -298,7 +299,13 @@ class OtgTrafficGen(AbstractTrafficGenerator):
                         matched.add(flow.name)
                         break
             if enable:
-                self._disabled_flows -= matched
+                # ``begin_test_case`` promises that only the selected flows
+                # are active.  Build the disabled set from the complete flow
+                # inventory instead of relying on a previous test case to
+                # have disabled non-matches first.
+                self._disabled_flows = {
+                    flow.name for flow in self.config.flows if flow.name not in matched
+                }
             else:
                 self._disabled_flows |= matched
 
@@ -591,6 +598,8 @@ class OtgTrafficGen(AbstractTrafficGenerator):
         for fm in resp.flow_metrics:
             tx = int(fm.frames_tx or 0)
             rx = int(fm.frames_rx or 0)
+            tx_bytes = int(fm.bytes_tx or 0)
+            rx_bytes = int(fm.bytes_rx or 0)
             loss = fm.loss
             if loss is None and tx > 0:
                 loss = (tx - rx) / tx * 100.0
@@ -599,6 +608,8 @@ class OtgTrafficGen(AbstractTrafficGenerator):
                     "name": fm.name,
                     "frames_tx": tx,
                     "frames_rx": rx,
+                    "bytes_tx": tx_bytes,
+                    "bytes_rx": rx_bytes,
                     "loss": loss,
                 }
             )
@@ -617,6 +628,8 @@ class OtgTrafficGen(AbstractTrafficGenerator):
             name = m["name"]
             tx = int(m.get("frames_tx") or 0)
             rx = int(m.get("frames_rx") or 0)
+            tx_bytes = int(m.get("bytes_tx") or 0)
+            rx_bytes = int(m.get("bytes_rx") or 0)
             loss_pct = float(m["loss"]) if m.get("loss") is not None else 0.0
             accumulated = self._flow_loss_accumulated.get(name, 0.0)
             loss_start = self._flow_loss_start.get(name)
@@ -628,6 +641,12 @@ class OtgTrafficGen(AbstractTrafficGenerator):
                     "packet_loss_duration": accumulated * 1000.0,
                     "packet_loss_percentage": loss_pct,
                     "frame_delta": float(tx - rx),
+                    # Match the RESTPy packet-loss statistics contract so
+                    # traffic evidence tasks work with either backend.
+                    "tx_frames": tx,
+                    "rx_frames": rx,
+                    "tx_bytes": tx_bytes,
+                    "rx_bytes": rx_bytes,
                 }
             )
         return stats
@@ -667,6 +686,10 @@ class OtgTrafficGen(AbstractTrafficGenerator):
             self._captured_stats.clear()
         self._flow_loss_start.clear()
         self._flow_loss_accumulated.clear()
+
+    def supports_controller_traffic_stats_reset(self) -> bool:
+        """OTG currently clears local samples, not controller counters."""
+        return False
 
     def check_packet_loss(
         self, max_loss_pct: float = 0.0
@@ -834,7 +857,13 @@ class OtgTrafficGen(AbstractTrafficGenerator):
         }
 
         if dg_cfg.bgp_config:
-            self._build_bgp_config(device, device_name, dg_cfg.bgp_config)
+            self._build_bgp_config(
+                device,
+                device_name,
+                dg_cfg.bgp_config,
+                port_name=port_name,
+                device_group_index=dg_index,
+            )
 
     def _build_bgp_on_port(self, port_name, port_cfg) -> None:
         bgp_info = getattr(port_cfg, "bgp_config_info", None)
@@ -858,7 +887,13 @@ class OtgTrafficGen(AbstractTrafficGenerator):
         ip_addresses = getattr(port_cfg, "ip_addresses", None)
         if ip_addresses:
             self._build_ip_stack(eth, device_name, ip_addresses)
-        self._build_bgp_config(device, device_name, bgp_info)
+        self._build_bgp_config(
+            device,
+            device_name,
+            bgp_info,
+            port_name=port_name,
+            device_group_index=0,
+        )
 
     def _build_ip_stack(self, eth, device_name, ip_cfg) -> None:
         if ip_cfg.ipv4_addresses_config:
@@ -899,7 +934,15 @@ class OtgTrafficGen(AbstractTrafficGenerator):
                         prefix=v6.subnet_mask,
                     )
 
-    def _build_bgp_config(self, device, device_name, bgp_info) -> None:
+    def _build_bgp_config(
+        self,
+        device,
+        device_name,
+        bgp_info,
+        *,
+        port_name: t.Optional[str] = None,
+        device_group_index: t.Optional[int] = None,
+    ) -> None:
         router_id_set = False
         for af_label, bgp_cfg in [
             ("v4", bgp_info.bgp_v4_config),
@@ -941,9 +984,26 @@ class OtgTrafficGen(AbstractTrafficGenerator):
 
             if bgp_cfg.bgp_prefix_configs:
                 for prefix_cfg in bgp_cfg.bgp_prefix_configs:
-                    self._build_bgp_prefix(peer, af_label, prefix_cfg)
+                    route_name = self._build_bgp_prefix(peer, af_label, prefix_cfg)
+                    if port_name is not None and device_group_index is not None:
+                        network_group_index = getattr(
+                            prefix_cfg, "network_group_index", None
+                        )
+                        # Older callers identify BGP endpoints only by the
+                        # explicit route name and legitimately omit the
+                        # optional network-group index. Keep that public path
+                        # working; BasicTrafficItem lowering supplies the index
+                        # and therefore gets the stronger identity mapping.
+                        if network_group_index is not None:
+                            self._register_bgp_route_name(
+                                port_name=port_name,
+                                device_group_index=device_group_index,
+                                network_group_index=network_group_index,
+                                address_family=af_label,
+                                route_name=route_name,
+                            )
 
-    def _build_bgp_prefix(self, peer, af_label, prefix_cfg) -> None:
+    def _build_bgp_prefix(self, peer, af_label, prefix_cfg) -> str:
         route_name = prefix_cfg.prefix_name or f"route_{af_label}"
         if af_label == "v4":
             route_range = peer.v4_routes.v4routerange()[-1]
@@ -980,6 +1040,30 @@ class OtgTrafficGen(AbstractTrafficGenerator):
             f"{prefix_cfg.starting_ip}/{prefix_cfg.prefix_length or 24} "
             f"x{prefix_cfg.count or 1}"
         )
+        return route_name
+
+    def _register_bgp_route_name(
+        self,
+        *,
+        port_name: str,
+        device_group_index: int,
+        network_group_index: int,
+        address_family: str,
+        route_name: str,
+    ) -> None:
+        key = (
+            port_name,
+            device_group_index,
+            network_group_index,
+            address_family,
+        )
+        existing = self._bgp_route_names.get(key)
+        if existing is not None:
+            raise ValueError(
+                "Ambiguous OTG BGP route-pool identity "
+                f"{key!r}: both {existing!r} and {route_name!r} are configured"
+            )
+        self._bgp_route_names[key] = route_name
 
     def _build_traffic_flows(self) -> None:
         if not self.ixia_config.traffic_items:
@@ -988,9 +1072,13 @@ class OtgTrafficGen(AbstractTrafficGenerator):
 
         for ti in self.ixia_config.traffic_items:
             tx_names = [
-                self._resolve_endpoint(ep) for ep in (ti.source_endpoints or [])
+                self._resolve_endpoint(ep, ti.traffic_type)
+                for ep in (ti.source_endpoints or [])
             ]
-            rx_names = [self._resolve_endpoint(ep) for ep in (ti.dest_endpoints or [])]
+            rx_names = [
+                self._resolve_endpoint(ep, ti.traffic_type)
+                for ep in (ti.dest_endpoints or [])
+            ]
 
             bidir = getattr(
                 getattr(ti, "traffic_flow_config", None),
@@ -1035,9 +1123,65 @@ class OtgTrafficGen(AbstractTrafficGenerator):
 
                 self.logger.info(f"[OTG]   Flow {flow_name}: {tx} -> {rx}")
 
-    def _resolve_endpoint(self, ep) -> str:
-        if ep.endpoint_type == ixia_types.EndpointType.BGP_PREFIX:
-            return ep.bgp_prefix_name or f"{ep.port_name}_route"
+    def _resolve_endpoint(self, ep, traffic_type=None) -> str:
+        endpoint_type = getattr(ep, "endpoint_type", ixia_types.EndpointType.IXIA_PORT)
+        network_group_index = getattr(ep, "network_group_index", None)
+        is_bgp_prefix = (
+            endpoint_type == ixia_types.EndpointType.BGP_PREFIX
+            or network_group_index is not None
+        )
+        if is_bgp_prefix:
+            explicit_name = getattr(ep, "bgp_prefix_name", None)
+            if (
+                endpoint_type == ixia_types.EndpointType.BGP_PREFIX
+                and network_group_index is None
+            ):
+                if not explicit_name:
+                    raise ValueError(
+                        "OTG BGP prefix endpoint must specify bgp_prefix_name "
+                        "or network_group_index"
+                    )
+                return explicit_name
+            if network_group_index is None:
+                raise ValueError(
+                    "OTG BGP prefix endpoint "
+                    f"{ep.port_name!r} device group {ep.device_group_index} "
+                    "must specify network_group_index"
+                )
+            if traffic_type == ixia_types.TrafficType.IPV4:
+                address_family = "v4"
+            elif traffic_type == ixia_types.TrafficType.IPV6:
+                address_family = "v6"
+            else:
+                raise ValueError(
+                    "OTG BGP prefix endpoint resolution requires an IPV4 or "
+                    f"IPV6 traffic type, got {traffic_type!r}"
+                )
+
+            key = (
+                ep.port_name,
+                ep.device_group_index,
+                network_group_index,
+                address_family,
+            )
+            route_name = self._bgp_route_names.get(key)
+            if route_name is None:
+                raise ValueError(
+                    "No OTG BGP route pool is configured for endpoint "
+                    f"(port={ep.port_name!r}, "
+                    f"device_group_index={ep.device_group_index}, "
+                    f"network_group_index={network_group_index}, "
+                    f"address_family={address_family!r})"
+                )
+
+            if explicit_name and explicit_name != route_name:
+                raise ValueError(
+                    "OTG BGP prefix endpoint is ambiguous: configured identity "
+                    f"{key!r} resolves to {route_name!r}, but bgp_prefix_name is "
+                    f"{explicit_name!r}"
+                )
+            return route_name
+
         dg_name = f"{ep.port_name}_DG{ep.device_group_index}"
         for port_cfg in self.ixia_config.port_configs:
             if port_cfg.port_name != ep.port_name:
